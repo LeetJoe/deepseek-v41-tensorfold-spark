@@ -6,11 +6,11 @@ Support me here: https://buymeacoffee.com/jayleaton
 
 Serve DeepSeek-V4.1-Flash (the 2.9 bpw EXL3 pack) across two NVIDIA DGX Sparks, tensor-parallel over the 200 Gb/s
 CX7 link, behind an OpenAI-compatible API. The engine is [TensorFold](https://github.com/ashhart/TensorFold) 0.6.0
-(pinned, unmodified submodule) plus two patches applied at image build: the two-Spark engine stack from the
-[GLM-5.3-Flash recipe](https://github.com/jayleaton/glm53-tensorfold-spark) and a DeepSeek-V4.1-Flash family written
+(pinned, unmodified submodule) plus three patches applied at image build: the two-Spark engine stack from the
+[GLM-5.3-Flash recipe](https://github.com/jayleaton/glm53-tensorfold-spark), a DeepSeek-V4.1-Flash family written
 for this model: exact DSpark speculative decoding, CED bounded-replay and exact full prefill, 4 request slots over a
 shared FP8 KV pool, NVMe sessions, native image input, structured output and tool calls, and both ranks failing fast
-together instead of hanging.
+together instead of hanging, and an Anthropic Messages API backport (`/v1/messages`) from TensorFold v0.6.3.
 
 > **Work in progress.** Measured on one pair of Sparks, against one baseline. Read
 > [what is not solved](docs/KNOWN-ISSUES.md) before relying on it.

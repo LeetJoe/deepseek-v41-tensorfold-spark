@@ -1,0 +1,2062 @@
+From 853ca6800677964cf67303bdcb9076432a34fb49 Mon Sep 17 00:00:00 2001
+From: x <x@x.x>
+Date: Sat, 10 Oct 2026 15:44:32 +0800
+Subject: [PATCH] Anthropic Messages API on the Spark and CUDA servers
+
+Port TensorFold v0.6.3's Anthropic Messages API (server/anthropic.py,
+server/anthropic_translate.py, server/request_body.py; the request-framing
+helpers) onto the v0.6.0 tree this project pins, so the built image answers
+/v1/messages and /v1/messages/count_tokens on the DeepSeek-V4.1-Flash Spark
+server too.
+
+Wiring: the anthropic route on the Spark, CUDA and generic HTTP handlers;
+matched_stop + reply stop_sequence; the DeepSeek app's prepare() hook for
+count_tokens; the Spark server emits stop_sequence. Tests and docs included.
+---
+ CHANGELOG.md                                  |  39 ++
+ README.md                                     |   2 +-
+ docs/api.md                                   |  27 +-
+ src/tensorfold/cuda/http.py                   |   8 +-
+ src/tensorfold/cuda/server.py                 |   6 +-
+ .../families/deepseek_v41/cuda/app.py         |  11 +
+ .../families/glm5_next/spark/server.py        |   7 +
+ src/tensorfold/server/anthropic.py            | 103 +++++
+ src/tensorfold/server/anthropic_translate.py  | 364 +++++++++++++++++
+ src/tensorfold/server/app.py                  |   7 +-
+ src/tensorfold/server/decision_requests.py    |  80 ++++
+ src/tensorfold/server/decisions.py            | 360 +++++++++++++++++
+ src/tensorfold/server/http.py                 |  62 ++-
+ src/tensorfold/server/request_body.py         |  81 ++++
+ src/tensorfold/server/responses.py            |  10 +-
+ src/tensorfold/server/stopping.py             |   6 +
+ src/tensorfold/server/token_routes.py         | 107 +++++
+ tests/test_anthropic_api.py                   | 382 ++++++++++++++++++
+ tests/test_server_refused_bodies.py           |  54 +++
+ 19 files changed, 1703 insertions(+), 13 deletions(-)
+ create mode 100644 src/tensorfold/server/anthropic.py
+ create mode 100644 src/tensorfold/server/anthropic_translate.py
+ create mode 100644 src/tensorfold/server/decision_requests.py
+ create mode 100644 src/tensorfold/server/decisions.py
+ create mode 100644 src/tensorfold/server/request_body.py
+ create mode 100644 src/tensorfold/server/token_routes.py
+ create mode 100644 tests/test_anthropic_api.py
+ create mode 100644 tests/test_server_refused_bodies.py
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 9ac3a6f..63a5cf2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -3,6 +3,45 @@
+ `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
+ GitHub has the full notes and the measurements behind them.
+ 
++## Unreleased
++
++- Anthropic Messages and token-count routes on MLX and CUDA, including streaming, tools, thinking and cache usage.
++
++## 0.6.2 (2 Oct 2026)
++
++- **Flash Next on Macs at 64k-128k.** On an M3 Ultra, one stream runs 1.2-3.4% faster at 64k and 3.9-5.5% at 128k,
++  with the same tokens: a window's n-gram ids are hashed on the GPU, and the chain's first step is built while the
++  GPU verifies.
++- **27B with several streams on CUDA.** The GDN tree kernel takes 8-35% less time with the same bits. On an RTX PRO
++  6000 at its 250 W limit, 4 and 8 streams of the NVFP4 27B decode 1.1-4.2% faster.
++- **Fixes:** the config check accepts the FP8 n-gram table in NVIDIA's MIXED_PRECISION Flash Next export; GLM-5.3
++  on CUDA counts its drafts in `/health`, `/metrics` and replies, and names a mixed-bit EXL3 checkpoint when it
++  refuses one; a client that leaves is noticed past file descriptor 1023; the CUDA server prints a line a request, as
++  the Mac server does; a failed snapshot write no longer leaves its partial file; Gemma 4's QKV kernel reserves its
++  1024 threads for M1, M2 and macOS VMs, and a VM's GPU is no longer taken for an M5.
++
++## 0.6.1 (1 Oct 2026)
++
++- **NVFP4 checkpoints in their own math.** `nvidia/Qwen3.8-27B-NVFP4` runs the 4-bit activations its checkpoint
++  names, as vLLM does; `--precision full` runs 16-bit activations against the same weights. On an RTX PRO 6000 at its
++  250 W limit, one stream decodes 1.4-2.0x vLLM and prompts fill at 0.95-0.97x its speed.
++- **Waiting prompts fill together on CUDA.** With `--parallel`, prompts that arrive together now share one prefill
++  forward instead of filling one a round: on an RTX PRO 6000 at its 250 W limit, 8 streams of the 27B run 1.14-1.36x
++  faster and the slowest first token comes in 0.05-0.10 s instead of 0.4-0.8 s (1.6 s to 0.15 s on a DGX Spark), with
++  the same replies.
++- **More 27B tokens with several streams on CUDA.** Streams plan on their measured round cost, and wider lane blocks
++  on RTX PRO and RTX 50 cards add 4-8% at 8 streams, with the same tokens.
++- **Flash Next on Macs at long context.** One stream runs up to 9.6% faster on code at 64k and 10.2% on chat at 128k
++  on an M3 Ultra, with the same tokens.
++- **`/v1/decisions`** scores a choice, a score or a yes/no from the next-token logits, on the shared prompt lanes.
++- **Flash Next on CUDA:** image input, forks that resume from their shared prefix, shared system prompts copied
++  instead of filled again, and short prompts admitted while a long one fills.
++- **RTX cards without Docker:** pip alone installs and builds the CUDA kernels. Native Windows is in as an
++  experimental host layer, not yet run on Windows hardware.
++- **Fixes:** a refused request no longer breaks the next one on its connection; Gemma 4 thought blocks stay out of
++  replies with thinking off; an unnamed reasoning effort goes to the nearest named level; mlx-lm 0.32 support.
++
++>>>>>>> 8cca6e3 (Add Anthropic Messages API on MLX and CUDA)
+ ## 0.6.0 (30 Sep 2026)
+ 
+ - **RTX 40 cards.** CUDA now runs on compute capability 8.9 (Ada). On one RTX 4090 the 27B serves with DFlash2 in a
+diff --git a/README.md b/README.md
+index f71cf47..201fa8f 100644
+--- a/README.md
++++ b/README.md
+@@ -9,7 +9,7 @@ tensorfold serve Vontra/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit
+ ```
+ 
+ Use `http://127.0.0.1:8080/v1` as the client base URL and the model ID from `/v1/models`. Both backends serve chat
+-completions, completions and OpenAI's Responses API (`/v1/responses`); see the [API reference](docs/api.md).
++completions, completions, OpenAI Responses (`/v1/responses`) and Anthropic Messages (`/v1/messages`); see the [API reference](docs/api.md).
+ Python 3.11 or newer is required, and MLX 0.32.2 or newer on a Mac (pip installs it). See the [runbook](RUNBOOK.md)
+ for installation and a first request. On NVIDIA GPUs the CUDA kernels need compute capability 8.9 or newer: Ada (RTX 40
+ series), Hopper and Blackwell, including the DGX Spark's GB10 and the RTX 50 series. NVFP4 and FP8 checkpoints need 9.0
+diff --git a/docs/api.md b/docs/api.md
+index 22208fa..8c22932 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -1,4 +1,4 @@
+-# OpenAI-compatible API
++# Compatible APIs
+ 
+ The base URL is `http://127.0.0.1:8080/v1` with the default server settings.
+ 
+@@ -8,6 +8,8 @@ The base URL is `http://127.0.0.1:8080/v1` with the default server settings.
+ | `GET /health` | Server health and available status information |
+ | `POST /v1/chat/completions` | Text chat, optional image input, tools and reasoning; streamed or non-streamed |
+ | `POST /v1/completions` | Raw text without a chat template; MLX also accepts token IDs |
++| `POST /v1/messages` | Anthropic Messages: text, supported images, function tools and thinking; JSON or SSE |
++| `POST /v1/messages/count_tokens` | Render the same model prompt without generating |
+ | `POST /v1/responses` | OpenAI's Responses API, run as the equivalent chat completion; streamed or non-streamed |
+ | `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}` | A stored response, or remove it |
+ 
+@@ -257,3 +259,26 @@ HTTP 400 refuses what this server does not run: built-in tools (web search, file
+ others), `background`, `include` (encrypted reasoning among them), `conversation`, `prompt` templates,
+ `truncation: "auto"`, `top_logprobs`, `input_file` parts and file IDs, `item_reference` items, encrypted reasoning
+ items, and a `previous_response_id` that is not stored.
++
++## Anthropic Messages
++
++The Messages routes reuse the same chat handler and engine on MLX and CUDA. They accept `system`, text/image
++blocks (including mid-conversation system text), `tool_use`/`tool_result`, custom tools and `tool_choice`, sampling, `stop_sequences`, `thinking`
++(disabled, enabled with `budget_tokens`, or adaptive), and `output_config` effort/JSON schema. Image support
++requires a vision-capable model served with `--vision`. Thinking is off unless enabled or adaptive. It round-trips as plaintext with an empty signature;
++`display` does not suppress it. Claude Code's `context_management` keep-all thinking directive is accepted. Mid-conversation system text stays
++in place with its system role; the model's chat template must support later system messages. Turn-scoped
++system messages, per-message output configuration and inline tool changes are unsupported.
++JSON schema output, including Claude Code title requests, requires `pip install 'tensorfold[grammar]'`.
++
++Usage separates uncached `input_tokens` from `cache_read_input_tokens` and reports `output_tokens_details.thinking_tokens`
++when the backend counts them. Prefix caching remains automatic,
++so `cache_control` hints do not allocate an Anthropic cache or report cache-creation tokens. Errors use the
++Anthropic error envelope, including after an SSE stream opens. Server-side tools, documents/file IDs,
++redacted thinking and other context edits return HTTP 400.
++
++Connect Claude Code using the ID from `/v1/models`:
++
++```bash
++ANTHROPIC_BASE_URL=http://127.0.0.1:8080 ANTHROPIC_API_KEY=local claude --model local-model
++```
+diff --git a/src/tensorfold/cuda/http.py b/src/tensorfold/cuda/http.py
+index 83f1ecc..b272985 100644
+--- a/src/tensorfold/cuda/http.py
++++ b/src/tensorfold/cuda/http.py
+@@ -8,7 +8,7 @@ import uuid
+ from typing import TYPE_CHECKING, Any
+ 
+ from tensorfold.cuda import health
+-from tensorfold.server import metrics, responses
++from tensorfold.server import anthropic, metrics, responses
+ from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
+ from tensorfold.server.errors import CapacityError, RequestError, error_body
+ from tensorfold.server.http import Server
+@@ -82,6 +82,8 @@ def make_handler(app: App):
+             responses.delete(self, app, responses.route(self.path))
+ 
+         def do_POST(self):
++            if anthropic.route(self.path):
++                return anthropic.post(self, app)
+             if responses.route(self.path) == "":         # a Response: this handler's chat completion, translated
+                 return responses.post(self, app)
+             chat = self.path.rstrip("/").endswith("/chat/completions")
+@@ -156,6 +158,8 @@ def make_handler(app: App):
+                                               "function": {"name": call["function"]["name"],
+                                                            "arguments": call["function"]["arguments"]}}]})
+                 end = chunk({}, result["finish"])
++                if result.get("stop_sequence") is not None:
++                    end["stop_sequence"] = result["stop_sequence"]
+                 end["tensorfold"] = result["stats"]
+                 end["usage"] = usage_of(result)          # every stream, as the Mac server's: clients count from it
+                 try:
+@@ -196,6 +200,8 @@ def make_handler(app: App):
+                 payload = {"id": rid, "object": "text_completion", "created": created, "model": model,
+                            "choices": [{"index": 0, "text": result["content"], "finish_reason": result["finish"]}],
+                            "usage": usage, "tensorfold": result["stats"]}
++            if result.get("stop_sequence") is not None:
++                payload["stop_sequence"] = result["stop_sequence"]
+             self._json(200, payload)
+ 
+     return Handler
+diff --git a/src/tensorfold/cuda/server.py b/src/tensorfold/cuda/server.py
+index 552720d..760953e 100644
+--- a/src/tensorfold/cuda/server.py
++++ b/src/tensorfold/cuda/server.py
+@@ -16,7 +16,7 @@ from tensorfold.server.errors import CONTEXT_LIMIT, RequestError, refusal
+ from tensorfold.server.messages import validate_modalities
+ from tensorfold.server.probabilities import TokenBytes, probability_options
+ from tensorfold.server.request_options import heard_effort, parse_numbers, thinking_fields
+-from tensorfold.server.stopping import stop_options
++from tensorfold.server.stopping import matched_stop, stop_options
+ from tensorfold.server.tool_policy import ToolCallPolicy
+ from tensorfold.engine.call_gate import CallGate, ThinkBudget, call_format, generate_gated
+ from tensorfold.engine.tool_draft import ToolCallStreamer
+@@ -442,7 +442,8 @@ class App:
+         final: dict[str, Any] = {}
+         if len(reasoning) > sent["reasoning"]:
+             final["reasoning_content"] = reasoning[sent["reasoning"]:]
+-        text = stops.visible(self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False))
++        raw_text = self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)
++        text = stops.visible(raw_text)
+         raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
+         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
+         content = policy.content(content) if tools else content
+@@ -457,6 +458,7 @@ class App:
+         # the calls already sent as deltas; the handler sends the rest (a call the streamer could not follow)
+         streamed = calls_stream.index + 1 if calls_stream is not None and calls_stream.streamed else 0
+         return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
++                "stop_sequence": matched_stop(raw_text, stops.strings),
+                 **({"logprobs": logprobs} if logprobs is not None else {}),
+                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
+                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
+diff --git a/src/tensorfold/families/deepseek_v41/cuda/app.py b/src/tensorfold/families/deepseek_v41/cuda/app.py
+index 076d41e..9390b82 100644
+--- a/src/tensorfold/families/deepseek_v41/cuda/app.py
++++ b/src/tensorfold/families/deepseek_v41/cuda/app.py
+@@ -45,6 +45,7 @@ import threading
+ from collections import OrderedDict
+ from collections.abc import Callable
+ from pathlib import Path
++from types import SimpleNamespace
+ from typing import Any
+ 
+ from tensorfold.families.glm5_next.spark import reqlog as reqlog_mod
+@@ -268,6 +269,15 @@ class Dsv41App(server.App):
+             return ids
+         return super().tokenize(body)
+ 
++    def prepare(self, body: dict[str, Any], chat: bool):
++        """The prompt a chat request would run, for the Messages API's ``count_tokens`` (no generation)."""
++
++        text, _, urls, _ = self._render(body)
++        ids = list(self.prompt_ids(text))
++        if urls:
++            ids = vision_prep.expand(ids, self._images(urls), self.vision_host.s, virtual=False)
++        return SimpleNamespace(prompt=ids)
++
+     def check(self, body: dict[str, Any]) -> str | None:
+         problem = super().check(body)
+         if problem:
+@@ -446,4 +456,5 @@ class Dsv41App(server.App):
+             stats = dict(stats or {}, images_omitted=omitted)
+         return {"final": {}, "calls": None if streaming else (call_dicts or None), "finish": finish,
+                 "content": content, "reasoning": reply.reasoning, "prompt_tokens": len(prompt),
++                "stop_sequence": server.matched_stop(text, tuple(stops or ())) if stops else None,
+                 "completion_tokens": used, "stats": stats}, thinking
+diff --git a/src/tensorfold/families/glm5_next/spark/server.py b/src/tensorfold/families/glm5_next/spark/server.py
+index eceacf1..e6cd4b7 100644
+--- a/src/tensorfold/families/glm5_next/spark/server.py
++++ b/src/tensorfold/families/glm5_next/spark/server.py
+@@ -30,6 +30,7 @@ from pathlib import Path
+ from typing import Any, Callable
+ 
+ from tensorfold.server.cancellation import RequestCancelled, socket_cancellation     # patches/0600 (upstream 24afe5e)
++from tensorfold.server import anthropic                                             # patches/0003: the Messages API
+ 
+ _THINK_END = "</think>"
+ _CALL_OPEN, _CALL_CLOSE = "<tool_call>", "</tool_call>"
+@@ -934,6 +935,8 @@ def make_handler(app: App):
+                 self._json(404, {"error": "not found"})
+ 
+         def do_POST(self):
++            if anthropic.route(self.path):
++                return anthropic.post(self, app)
+             path = self.path.rstrip("/")
+             chat = path.endswith("/chat/completions")
+             tokenize = path in ("/tokenize", "/v1/tokenize")        # patches/0490
+@@ -1026,6 +1029,8 @@ def make_handler(app: App):
+                                               "function": {"name": call["function"]["name"],
+                                                            "arguments": call["function"]["arguments"]}}]})
+                 end = chunk({}, result["finish"])
++                if result.get("stop_sequence") is not None:
++                    end["stop_sequence"] = result["stop_sequence"]
+                 usage = {"prompt_tokens": result["prompt_tokens"], "completion_tokens": result["completion_tokens"],
+                          "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
+                          "prompt_tokens_details": _cached(result)}          # patches/0110
+@@ -1062,6 +1067,8 @@ def make_handler(app: App):
+                 payload = {"id": rid, "object": "chat.completion", "created": created, "model": app.served,
+                            "choices": [{"index": 0, "message": message, "finish_reason": result["finish"]}],
+                            "usage": usage, "tensorfold": result["stats"]}
++                if result.get("stop_sequence") is not None:
++                    payload["stop_sequence"] = result["stop_sequence"]
+             else:
+                 payload = {"id": rid, "object": "text_completion", "created": created, "model": app.served,
+                            "choices": [{"index": 0, "text": result["content"], "finish_reason": result["finish"]}],
+diff --git a/src/tensorfold/server/anthropic.py b/src/tensorfold/server/anthropic.py
+new file mode 100644
+index 0000000..3316f5b
+--- /dev/null
++++ b/src/tensorfold/server/anthropic.py
+@@ -0,0 +1,103 @@
++"""Anthropic HTTP routes on both servers, over their own chat-completions handler and connection."""
++from __future__ import annotations
++
++import json
++from typing import Any
++
++from tensorfold.server.anthropic_translate import Reply, error, translate
++from tensorfold.server.errors import CapacityError, RequestError
++from tensorfold.server.request_body import read_body
++from tensorfold.server.responses import LIMIT, Wire, _run_chat, _send
++
++
++def route(path: str) -> bool:
++    return path.split("?", 1)[0].rstrip("/") in ("/v1/messages", "/messages", "/v1/messages/count_tokens",
++                                                 "/messages/count_tokens")
++
++
++def count_tokens(app: Any, chat: dict[str, Any]) -> int:
++    """Render with the same tokenizer, tools and thinking controls as chat, without running generation."""
++    if hasattr(app, "prepare"):                   # CUDA's preparation includes vision token expansion
++        return len(app.prepare(chat, True).prompt)
++    from tensorfold.server.messages import normalize_messages
++    from tensorfold.server.prompts import has_images, prepare_images
++    from tensorfold.server.request_options import heard_effort, thinking_fields
++    from tensorfold.server.text import render_prompt_ids
++    from tensorfold.server.tools import active_tool_specs
++
++    fields = thinking_fields(chat, app.effort_levels)
++    thinking = fields.get("enable_thinking", app.enable_thinking)
++    effort = heard_effort(fields.get("reasoning_effort"), app.reasoning_effort, app.effort_levels)
++    tools = active_tool_specs(chat.get("tools"), chat.get("tool_choice"))
++    msgs = normalize_messages(chat["messages"], allow_images=getattr(app, "vision", None) is not None)
++    if has_images(msgs):
++        from tensorfold.server.messages import _normalize_tool_call_arguments
++        msgs = _normalize_tool_call_arguments(msgs)
++
++        def render(messages):
++            kwargs = {"tokenize": False, "add_generation_prompt": True, "enable_thinking": thinking}
++            if tools:
++                kwargs["tools"] = tools
++            if thinking and effort:
++                kwargs["reasoning_effort"] = effort
++            with app.tokenizer_lock:
++                return app.tokenizer.apply_chat_template(messages, **kwargs)
++
++        return len(prepare_images(app.vision, msgs, render, context_limit=app.context_window or None).tokens)
++    with app.tokenizer_lock:
++        return len(render_prompt_ids(app.tokenizer, msgs, tools=tools, enable_thinking=thinking,
++                                     reasoning_effort=effort, late_system=app.late_system))
++
++
++def post(handler: Any, app: Any) -> None:
++    from tensorfold.server.http import reply_model
++
++    count = handler.path.split("?", 1)[0].rstrip("/").endswith("/count_tokens")
++    try:
++        raw = read_body(handler, limit=LIMIT)
++        body = json.loads(raw or b"{}")
++        chat = translate(body, count=count)
++        if chat.get("stream"):
++            chat.setdefault("stream_options", {})["include_usage"] = True
++        late_system = getattr(app, "late_system", getattr(getattr(app, "template", None), "late_system", "system"))
++        if late_system != "system" and any(m.get("role") == "system" for m in body["messages"]):
++            raise RequestError("the model's chat template does not support mid-conversation system messages")
++        if count:
++            return _send(handler, 200, {"input_tokens": count_tokens(app, chat)})
++    except (RequestError, ValueError, UnicodeDecodeError) as exc:
++        return _send(handler, 503 if isinstance(exc, CapacityError) else 400,
++                     error(str(exc), 503 if isinstance(exc, CapacityError) else 400))
++
++    def send(event: dict[str, Any]) -> None:
++        handler.wfile.write(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode())
++        handler.wfile.flush()
++
++    reply = Reply(reply_model(app, body), send)
++
++    def opened() -> None:
++        handler.send_response(200)
++        handler.send_header("Content-Type", "text/event-stream")
++        handler.send_header("Cache-Control", "no-cache")
++        handler.send_header("Connection", "close")
++        handler.end_headers()
++        handler.close_connection = True
++        reply.start()
++
++    wire = Wire(opened, reply.chunk)
++    try:
++        _run_chat(handler, chat, wire)
++        if wire.stream or wire.status is None:
++            return
++        payload = json.loads(bytes(wire.data) or b"{}")
++        if wire.status != 200:
++            problem = payload.get("error") or {}
++            message = problem.get("message", "request failed") if isinstance(problem, dict) else str(problem)
++            return _send(handler, wire.status, error(message, wire.status))
++        _send(handler, 200, reply.completion(payload))
++    except OSError:
++        handler.close_connection = True
++    except (ValueError, KeyError, TypeError) as exc:
++        if wire.stream:
++            send(error(f"invalid model response: {exc}", 500))
++        else:
++            _send(handler, 500, error(f"invalid model response: {exc}", 500))
+diff --git a/src/tensorfold/server/anthropic_translate.py b/src/tensorfold/server/anthropic_translate.py
+new file mode 100644
+index 0000000..ba6d9f6
+--- /dev/null
++++ b/src/tensorfold/server/anthropic_translate.py
+@@ -0,0 +1,364 @@
++"""Anthropic Messages translated to the server's existing chat request and reply contracts."""
++from __future__ import annotations
++
++import json
++import uuid
++from collections.abc import Callable
++from typing import Any
++
++from tensorfold.server.errors import RequestError
++from tensorfold.server.request_options import EFFORTS
++
++
++def _string(value: Any, name: str, *, empty: bool = True) -> str:
++    if not isinstance(value, str) or (not empty and not value):
++        raise RequestError(f"{name} must be a {'nonempty ' if not empty else ''}string")
++    return value
++
++
++def _parts(value: Any) -> list[dict[str, Any]]:
++    if isinstance(value, str):
++        return [{"type": "text", "text": value}]
++    if not isinstance(value, list) or any(not isinstance(p, dict) for p in value):
++        raise RequestError("content must be a string or an array of content blocks")
++    return value
++
++
++def _image(block: dict[str, Any]) -> dict[str, Any]:
++    source = block.get("source")
++    if not isinstance(source, dict):
++        raise RequestError("image.source must be an object")
++    if source.get("type") == "base64":
++        media = _string(source.get("media_type"), "image.source.media_type", empty=False)
++        if media not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
++            raise RequestError("unsupported image media_type")
++        url = f"data:{media};base64,{_string(source.get('data'), 'image.source.data', empty=False)}"
++    elif source.get("type") == "url":
++        url = _string(source.get("url"), "image.source.url", empty=False)
++    else:
++        raise RequestError("image.source.type must be base64 or url; file IDs are unsupported")
++    return {"type": "image_url", "image_url": {"url": url}}
++
++
++def messages(value: Any, system: Any = None) -> list[dict[str, Any]]:
++    if not isinstance(value, list) or not value:
++        raise RequestError("messages must be a nonempty array")
++    out: list[dict[str, Any]] = []
++    if system is not None:
++        parts = _parts(system)
++        if any(p.get("type") != "text" for p in parts):
++            raise RequestError("system accepts text blocks only")
++        out.append({"role": "system", "content": "\n\n".join(_string(p.get("text"), "system.text") for p in parts)})
++    for index, message in enumerate(value):
++        if not isinstance(message, dict) or message.get("role") not in ("user", "assistant", "system"):
++            raise RequestError("message role must be user, assistant or system")
++        role = message["role"]
++        if role == "system":
++            previous = value[index - 1] if index else {}
++            following = value[index + 1] if index + 1 < len(value) else {"role": "assistant"}
++            if (not isinstance(previous, dict) or previous.get("role") not in ("user", "system")
++                    or not isinstance(following, dict) or following.get("role") not in ("assistant", "system")):
++                raise RequestError("mid-conversation system messages must follow a user turn and precede an assistant or end")
++            if message.get("clear_at") not in (None, "never") or message.get("output_config"):
++                raise RequestError("turn-scoped system messages and per-message output_config are unsupported")
++        content, calls, thoughts = [], [], []
++        for block in _parts(message.get("content")):
++            kind = block.get("type")
++            if kind == "text":
++                content.append({"type": "text", "text": _string(block.get("text"), "text")})
++            elif kind == "image" and role == "user":
++                content.append(_image(block))
++            elif kind == "thinking" and role == "assistant":
++                thoughts.append(_string(block.get("thinking"), "thinking"))
++            elif kind == "redacted_thinking" and role == "assistant":
++                raise RequestError("redacted thinking cannot be decoded by this local model; send plaintext thinking")
++            elif kind == "tool_use" and role == "assistant":
++                arguments = block.get("input")
++                if not isinstance(arguments, dict):
++                    raise RequestError("tool_use.input must be an object")
++                calls.append({"id": _string(block.get("id"), "tool_use.id", empty=False), "type": "function",
++                              "function": {"name": _string(block.get("name"), "tool_use.name", empty=False),
++                                           "arguments": json.dumps(arguments, ensure_ascii=False)}})
++            elif kind == "tool_result" and role == "user":
++                # Tool results precede the following user text, including a batch of parallel results.
++                texts, parts, has_image = [], [], False
++                for part in _parts(block.get("content", "")):
++                    if part.get("type") == "text":
++                        text = _string(part.get("text"), "tool_result.text")
++                        texts.append(text)
++                        parts.append({"type": "text", "text": text})
++                    elif part.get("type") == "image":
++                        parts.append(_image(part))
++                        has_image = True
++                    else:
++                        raise RequestError(f"unsupported tool_result content type {part.get('type')!r}")
++                text = "\n".join(texts)
++                if block.get("is_error"):
++                    text = "Tool error: " + text
++                    parts.insert(0, {"type": "text", "text": "Tool error: "})
++                out.append({"role": "tool", "tool_call_id": _string(block.get("tool_use_id"), "tool_use_id", empty=False),
++                            "content": parts if has_image else text})
++            else:
++                raise RequestError(f"unsupported {role} content block type {kind!r}")
++        if content or calls or thoughts:
++            item: dict[str, Any] = {"role": role, "content": content or ""}
++            if calls:
++                item["tool_calls"] = calls
++            if thoughts:
++                item["reasoning_content"] = "".join(thoughts)
++            out.append(item)
++        elif not _parts(message.get("content")):
++            out.append({"role": role, "content": ""})
++    return out
++
++
++def translate(body: Any, *, count: bool = False) -> dict[str, Any]:
++    if not isinstance(body, dict):
++        raise RequestError("request body must be an object")
++    model = _string(body.get("model"), "model", empty=False)
++    chat: dict[str, Any] = {"model": model, "messages": messages(body.get("messages"), body.get("system"))}
++    if not count:
++        limit = body.get("max_tokens")
++        if type(limit) is not int or limit <= 0:
++            raise RequestError("max_tokens must be a positive integer")
++        chat["max_tokens"] = limit
++    else:
++        chat["max_tokens"] = 1
++    if "stream" in body:
++        if type(body["stream"]) is not bool:
++            raise RequestError("stream must be a boolean")
++        chat["stream"] = body["stream"]
++    for key in ("temperature", "top_p", "top_k"):
++        if key in body:
++            chat[key] = body[key]
++    if "stop_sequences" in body:
++        stops = body["stop_sequences"]
++        if not isinstance(stops, list) or any(not isinstance(s, str) or not s for s in stops):
++            raise RequestError("stop_sequences must be an array of nonempty strings")
++        chat["stop"] = stops
++    context = body.get("context_management")
++    # Claude Code keeps all thinking; the client supplies history and there is no stored context to edit.
++    if context is not None and (not isinstance(context, dict) or not isinstance(context.get("edits", []), list)
++            or any(edit != {"type": "clear_thinking_20251015", "keep": "all"} for edit in context.get("edits", []))):
++        raise RequestError("context_management supports clear_thinking with keep: all only")
++    for field in ("container", "mcp_servers", "service_tier"):
++        if body.get(field) not in (None, [], "auto"):
++            raise RequestError(f"{field} is not supported by this server")
++    tools = body.get("tools", [])
++    if not isinstance(tools, list):
++        raise RequestError("tools must be an array")
++    translated = []
++    for tool in tools:
++        if not isinstance(tool, dict) or tool.get("type", "custom") != "custom":
++            raise RequestError("only client-defined function tools are supported")
++        name = _string(tool.get("name"), "tool.name", empty=False)
++        schema = tool.get("input_schema")
++        if not isinstance(schema, dict):
++            raise RequestError("tool.input_schema must be an object")
++        fn = {"name": name, "parameters": schema}
++        if "description" in tool:
++            fn["description"] = _string(tool["description"], "tool.description")
++        translated.append({"type": "function", "function": fn})
++    if translated:
++        chat["tools"] = translated
++    choice = body.get("tool_choice")
++    if choice is not None:
++        if not isinstance(choice, dict):
++            raise RequestError("tool_choice must be an object")
++        kind = choice.get("type")
++        if kind in ("auto", "none", "any"):
++            chat["tool_choice"] = "required" if kind == "any" else kind
++        elif kind == "tool":
++            chat["tool_choice"] = {"type": "function", "function": {
++                "name": _string(choice.get("name"), "tool_choice.name", empty=False)}}
++        else:
++            raise RequestError("tool_choice.type must be auto, none, any or tool")
++        if "disable_parallel_tool_use" in choice:
++            if type(choice["disable_parallel_tool_use"]) is not bool:
++                raise RequestError("disable_parallel_tool_use must be a boolean")
++            chat["parallel_tool_calls"] = not choice["disable_parallel_tool_use"]
++    config = body.get("output_config", {})
++    config = {} if config is None else config
++    if not isinstance(config, dict):
++        raise RequestError("output_config must be an object")
++    if "effort" in config:
++        if config["effort"] not in EFFORTS:
++            raise RequestError("unsupported output_config.effort")
++        chat["reasoning_effort"] = config["effort"]
++    if config.get("format") is not None:
++        fmt = config["format"]
++        if not isinstance(fmt, dict) or fmt.get("type") != "json_schema" or not isinstance(fmt.get("schema"), dict):
++            raise RequestError("output_config.format must be json_schema with a schema object")
++        chat["response_format"] = {"type": "json_schema", "json_schema": {"name": "response", "schema": fmt["schema"],
++                                                                       "strict": True}}
++    thinking = body.get("thinking")
++    if thinking is None:
++        thinking = {"type": "disabled"}
++    if thinking is not None:
++        if not isinstance(thinking, dict) or thinking.get("type") not in ("disabled", "enabled", "adaptive"):
++            raise RequestError("thinking.type must be disabled, enabled or adaptive")
++        enabled = thinking["type"] != "disabled"
++        chat["chat_template_kwargs"] = {"enable_thinking": enabled}
++        if not enabled:
++            chat["reasoning_effort"] = "none"
++        if thinking["type"] == "enabled":
++            budget = thinking.get("budget_tokens")
++            if type(budget) is not int or budget <= 0 or (not count and budget >= body["max_tokens"]):
++                raise RequestError("thinking.budget_tokens must be positive and less than max_tokens")
++            chat["thinking_budget"] = budget
++    return chat
++
++
++def usage(value: dict[str, Any]) -> dict[str, Any]:
++    prompt = value.get("prompt_tokens", 0)
++    cached = min(prompt, max(0, (value.get("prompt_tokens_details") or {}).get("cached_tokens", 0)))
++    result = {"input_tokens": prompt - cached, "output_tokens": value.get("completion_tokens", 0),
++              "cache_creation_input_tokens": 0, "cache_read_input_tokens": cached}
++    details = value.get("completion_tokens_details") or {}
++    if "reasoning_tokens" in details:
++        result["output_tokens_details"] = {"thinking_tokens": details["reasoning_tokens"]}
++    return result
++
++
++def error(message: str, status: int = 400) -> dict[str, Any]:
++    kind = ("invalid_request_error" if status == 400 else "not_found_error" if status == 404 else
++            "overloaded_error" if status == 503 else "api_error")
++    return {"type": "error", "error": {"type": kind, "message": message}}
++
++
++class Reply:
++    """Typed Messages events from chat chunks, keeping each delta on a block of the matching type."""
++
++    def __init__(self, model: str, send: Callable[[dict[str, Any]], None]) -> None:
++        self.send = send
++        self.base = {"id": "msg_" + uuid.uuid4().hex, "type": "message", "role": "assistant", "model": model,
++                     "content": [], "stop_reason": None, "stop_sequence": None, "usage": usage({})}
++        self.index = -1
++        self.kind: str | None = None
++        self.calls: dict[int, dict[str, Any]] = {}
++        self.pending_text: list[tuple[str, str]] = []
++        self.active_call: int | None = None
++        self.finished = False
++        self.finish = "end_turn"
++        self.stop_sequence: str | None = None
++        self.tokens = usage({})
++
++    def start(self) -> None:
++        self.send({"type": "message_start", "message": self.base})
++
++    def close(self) -> None:
++        if self.kind:
++            if self.kind == "thinking":
++                # Local reasoning is plaintext, with no provider signature or encryption.
++                self.send({"type": "content_block_delta", "index": self.index,
++                           "delta": {"type": "signature_delta", "signature": ""}})
++            self.send({"type": "content_block_stop", "index": self.index})
++            self.kind = None
++
++    def text(self, kind: str, value: str) -> None:
++        if not value:
++            return
++        if self.active_call is not None:
++            self.pending_text.append((kind, value))
++            return
++        if kind != self.kind:
++            self.close()
++            self.index += 1
++            self.kind = kind
++            block = {"type": kind, "thinking" if kind == "thinking" else "text": ""}
++            self.send({"type": "content_block_start", "index": self.index, "content_block": block})
++        self.send({"type": "content_block_delta", "index": self.index,
++                   "delta": {"type": kind + "_delta", "thinking" if kind == "thinking" else "text": value}})
++
++    def chunk(self, chunk: dict[str, Any] | None) -> None:
++        if self.finished:
++            return
++        if chunk is None:
++            self.drain_calls(final=True)
++            self.close()
++            self.send({"type": "message_delta", "delta": {"stop_reason": self.finish, "stop_sequence": self.stop_sequence},
++                       "usage": self.tokens})
++            self.send({"type": "message_stop"})
++            self.finished = True
++            return
++        if "error" in chunk:
++            self.close()
++            problem = chunk["error"]
++            self.send(error(problem.get("message", "generation failed"),
++                            400 if problem.get("type") == "invalid_request_error" else 500))
++            self.finished = True
++            return
++        if chunk.get("usage") is not None:
++            self.tokens = usage(chunk["usage"])
++        if chunk.get("stop_sequence") is not None:
++            self.stop_sequence = chunk["stop_sequence"]
++        for choice in chunk.get("choices", []):
++            if choice.get("finish_reason"):
++                self.finish = {"tool_calls": "tool_use", "length": "max_tokens"}.get(choice["finish_reason"], "end_turn")
++            if self.stop_sequence is not None:
++                self.finish = "stop_sequence"
++            delta = choice.get("delta") or {}
++            self.text("thinking", delta.get("reasoning_content") or "")
++            self.text("text", delta.get("content") or "")
++            for call in delta.get("tool_calls") or []:
++                at = call.get("index", 0)
++                target = self.calls.setdefault(at, {"id": "", "name": "", "arguments": "", "sent": 0, "done": False})
++                if call.get("id"):
++                    target["id"] = call["id"]
++                fn = call.get("function") or {}
++                target["name"] += fn.get("name") or ""
++                target["arguments"] += fn.get("arguments") or ""
++
++        self.drain_calls()
++
++    def drain_calls(self, *, final: bool = False) -> None:
++        for at, call in self.calls.items():
++            if call["done"]:
++                continue
++            if not call["id"] or not call["name"]:
++                return
++            if self.active_call is None:
++                self.close()
++                self.index += 1
++                self.kind, self.active_call = "tool_use", at
++                self.send({"type": "content_block_start", "index": self.index,
++                           "content_block": {"type": "tool_use", "id": call["id"], "name": call["name"], "input": {}}})
++            if at != self.active_call:
++                return
++            delta = call["arguments"][call["sent"]:]
++            if delta:
++                self.send({"type": "content_block_delta", "index": self.index,
++                           "delta": {"type": "input_json_delta", "partial_json": delta}})
++                call["sent"] = len(call["arguments"])
++            complete = False
++            if call["arguments"].rstrip().endswith("}"):
++                try:
++                    complete = isinstance(json.loads(call["arguments"]), dict)
++                except ValueError:
++                    pass
++            if not complete and not final:
++                return
++            self.close()
++            call["done"], self.active_call = True, None
++            pending, self.pending_text = self.pending_text, []
++            for kind, text in pending:
++                self.text(kind, text)
++
++    def completion(self, chunk: dict[str, Any]) -> dict[str, Any]:
++        choice = chunk["choices"][0]
++        message = choice["message"]
++        content = []
++        if message.get("reasoning_content"):
++            content.append({"type": "thinking", "thinking": message["reasoning_content"], "signature": ""})
++        if message.get("content"):
++            content.append({"type": "text", "text": message["content"]})
++        for call in message.get("tool_calls") or []:
++            fn = call["function"]
++            args = json.loads(fn["arguments"]) if isinstance(fn["arguments"], str) else fn["arguments"]
++            if not isinstance(args, dict):
++                raise TypeError("model tool arguments are not a JSON object")
++            content.append({"type": "tool_use", "id": call["id"], "name": fn["name"], "input": args})
++        return {**self.base, "content": content, "usage": usage(chunk.get("usage") or {}),
++                "stop_sequence": chunk.get("stop_sequence"),
++                "stop_reason": "stop_sequence" if chunk.get("stop_sequence") is not None else
++                {"tool_calls": "tool_use", "length": "max_tokens"}.get(choice["finish_reason"], "end_turn")}
+diff --git a/src/tensorfold/server/app.py b/src/tensorfold/server/app.py
+index 58f7a68..f3356f5 100644
+--- a/src/tensorfold/server/app.py
++++ b/src/tensorfold/server/app.py
+@@ -21,7 +21,8 @@ from tensorfold.server.request_options import RequestOptions
+ from tensorfold.server.http import served_model_ids
+ from tensorfold.server import metrics
+ from tensorfold.server.scheduler import ChatJob, Scheduler
+-from tensorfold.server.stopping import StopPolicy
++from tensorfold.server.stopping import StopPolicy, matched_stop
++from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
+ from tensorfold.server.text import (
+     IncrementalText,
+     _LockedTokenizer,
+@@ -436,7 +437,8 @@ class ChatApp(RequestOptions, PromptBlocks):
+ 
+         content_tokens = strip_trailing_stops(collected, set(stops.eos_ids))
+         with self.tokenizer_lock:
+-            text = stops.visible(self.tokenizer.decode(content_tokens))
++            raw_text = self.tokenizer.decode(content_tokens)
++            text = stops.visible(raw_text)
+         if thinking:
+             reasoning_text, content = split_thinking(text, finished=True, markers=self.think_markers)
+             reasoning = reasoning_text.strip() or None
+@@ -449,6 +451,7 @@ class ChatApp(RequestOptions, PromptBlocks):
+         decode_tokens = max(0, len(collected) - 1)
+         reply: dict[str, Any] = {
+             "content": content,
++            "stop_sequence": matched_stop(raw_text, stops.strings),
+             "reasoning": reasoning,
+             "tool_calls_streamed": bool(calls_stream is not None and calls_stream.streamed),
+             "finish_reason": stream.finish_reason if stream is not None else "length",
+diff --git a/src/tensorfold/server/decision_requests.py b/src/tensorfold/server/decision_requests.py
+new file mode 100644
+index 0000000..a581350
+--- /dev/null
++++ b/src/tensorfold/server/decision_requests.py
+@@ -0,0 +1,80 @@
++"""Mac ``/v1/decisions`` requests: one prompt-lane prefill per question, scored from its last row."""
++
++from __future__ import annotations
++
++import uuid
++from typing import Any
++
++from tensorfold.server.decisions import DecisionError, _render_text, _wording, build_response, prepare
++from tensorfold.server.errors import RequestError
++from tensorfold.server.scheduler import ChatJob
++
++
++class DecisionRequests:
++    """Submit each decision question as a prompt-lane job and return its label logits."""
++
++    def _decision_keep(self, text: str, content: str, prompt_ids: list[int]) -> tuple[int, tuple[int, ...], int]:
++        """History length, shared-prefix cuts, and where a different question stops sharing tokens."""
++
++        from tensorfold.server.checkpoints import longest_common_prefix
++        from tensorfold.server.text import render_prompt_ids
++
++        # The input stays when the question changes. A chat keeps a system block with these same cuts.
++        messages = [{"role": "user", "content": content}]
++        probe = [{"role": "user", "content": f"{text}\n\n\u2063probe"}]
++        try:
++            with self.tokenizer_lock:
++                history = render_prompt_ids(self.tokenizer, messages, enable_thinking=False,
++                                            add_generation_prompt=False)
++                other = render_prompt_ids(self.tokenizer, probe, enable_thinking=False)
++        except Exception:  # noqa: BLE001 - a template quirk must not fail the request
++            return 0, (), 0
++        prefix = 0 < len(history) < len(prompt_ids) and prompt_ids[:len(history)] == history
++        history_len = len(history) if prefix else 0
++        shared = longest_common_prefix(prompt_ids, other)
++        if not 512 <= shared < len(prompt_ids):
++            return history_len, (), shared if 0 < shared < len(prompt_ids) else 0
++        cuts = tuple(n for n in (shared - 2048, shared - 512, shared) if n >= 512)
++        return history_len, cuts, shared
++
++    def decisions(self, body: dict[str, Any]) -> dict[str, Any]:
++        """Answer typed questions from the last row of a prompt-lane prefill. No text is generated."""
++
++        try:
++            with self.tokenizer_lock:
++                prepared = prepare(self.tokenizer, body, context_len=self.context_window or None)
++        except DecisionError as exc:
++            raise RequestError(str(exc)) from exc
++        text = _render_text(body.get("input"))
++        jobs = []
++        prefixes = []
++        for item, question in zip(prepared, body["questions"]):
++            _, _, _, content = _wording(text, question)
++            history_len, shared, prefix_len = self._decision_keep(text, content, list(item.prompt_ids))
++            job = ChatJob(
++                job_id=f"decision-{uuid.uuid4().hex[:8]}",
++                prompt_ids=list(item.prompt_ids),
++                max_tokens=1,
++                temperature=0.0,
++                drafts=False,
++                label_ids=tuple(item.label_ids),
++                history_len=history_len,
++                shared_prefix_lens=shared,
++            )
++            self.scheduler.submit(job)
++            jobs.append((item, job))
++            prefixes.append(prefix_len)
++        scored = []
++        for (item, job), prefix_len in zip(jobs, prefixes):
++            if not job.done.wait(600.0):
++                raise TimeoutError("the engine did not score the prompt in time")
++            if isinstance(job.error, ValueError):
++                raise RequestError(f"question {item.id!r}: {job.error}") from job.error
++            if job.error is not None:
++                raise job.error
++            logits, total = job.scored
++            shown = ",".join(repr(value) for value in logits)
++            print(f"[tensorfold] decision {job.job_id} cached={job.cached_tokens} "
++                  f"prefix={prefix_len} logits={shown} logsumexp={total!r}", flush=True)
++            scored.append(job.scored)
++        return build_response(body, prepared, scored)
+diff --git a/src/tensorfold/server/decisions.py b/src/tensorfold/server/decisions.py
+new file mode 100644
+index 0000000..cb6f3b4
+--- /dev/null
++++ b/src/tensorfold/server/decisions.py
+@@ -0,0 +1,360 @@
++"""``/v1/decisions`` scores one prefill's label logits and returns no generated text."""
++# Wording and probability math follow SGLang prompt format v1; logits come from this prefill, not score_prompts.
++
++from __future__ import annotations
++
++import json
++import math
++import string
++from dataclasses import dataclass
++from typing import Any
++
++from tensorfold.server.text import render_prompt_ids
++
++PROMPT_FORMAT_VERSION = 1
++
++_TOP_FIELDS = frozenset({
++    "input", "questions", "temperature", "chat_template_kwargs",
++    "prompt_format_version", "return_prompt_token_ids", "model",
++})
++_CHOICE_FIELDS = frozenset({"id", "type", "question", "options"})
++_SCORE_FIELDS = frozenset({"id", "type", "question", "levels"})
++_YES_NO_FIELDS = frozenset({"id", "type", "question", "yes", "no"})
++_OPTION_FIELDS = frozenset({"name", "description"})
++
++
++class DecisionError(ValueError):
++    """A request this route refuses before scoring."""
++
++
++@dataclass(frozen=True)
++class PreparedQuestion:
++    id: str
++    kind: str
++    names: list[str]
++    prompt_ids: list[int]
++    label_ids: list[int]
++
++
++def prepare(tokenizer: Any, body: dict[str, Any], *, context_len: int | None = None) -> list[PreparedQuestion]:
++    """Render every question and check that each answer label is one token."""
++
++    _validate_body(body)
++    text = _render_text(body.get("input"))
++    if not text.strip():
++        raise DecisionError("input must not be blank")
++    prepared = []
++    for index, question in enumerate(body["questions"]):
++        try:
++            prepared.append(_prepare_question(tokenizer, text, question, context_len=context_len))
++        except DecisionError as exc:
++            ident = question.get("id") if isinstance(question, dict) else None
++            where = repr(ident) if isinstance(ident, str) and ident else f"at position {index}"
++            raise DecisionError(f"question {where}: {exc}") from exc
++    return prepared
++
++
++def build_response(
++    body: dict[str, Any],
++    prepared: list[PreparedQuestion],
++    scored: list[tuple[list[float], float]],
++) -> dict[str, Any]:
++    """SGLang's decision response. ``scored`` is label logits and the full-vocabulary logsumexp, one row a question."""
++
++    temperature = float(body.get("temperature") or 1.0)
++    answers = {}
++    prompt_tokens = 0
++    for item, (logits, logsumexp) in zip(prepared, scored):
++        probabilities = _softmax(logits, temperature)
++        logprobs = [logit - logsumexp for logit in logits]
++        answer: dict[str, Any] = {
++            "type": item.kind,
++            "probabilities": dict(zip(item.names, probabilities)),
++            "label_mass": math.fsum(math.exp(logprob) for logprob in logprobs),
++        }
++        if item.kind == "choice":
++            answer["choice"] = item.names[probabilities.index(max(probabilities))]
++        elif item.kind == "score":
++            answer["score"] = math.fsum(index * probability for index, probability in enumerate(probabilities))
++        if body.get("return_prompt_token_ids"):
++            answer["prompt_token_ids"] = item.prompt_ids
++            answer["label_token_ids"] = item.label_ids
++        answers[item.id] = answer
++        prompt_tokens += len(item.prompt_ids)
++    return {
++        "object": "decisions",
++        "model": body.get("model") or "default",
++        "prompt_format_version": PROMPT_FORMAT_VERSION,
++        "answers": answers,
++        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 0, "total_tokens": prompt_tokens},
++    }
++
++
++def _validate_body(body: dict[str, Any]) -> None:
++    unknown = sorted(set(body) - _TOP_FIELDS)
++    if unknown:
++        raise DecisionError(f"unknown field {unknown[0]!r}")
++    version = body.get("prompt_format_version")
++    if version is not None and version != PROMPT_FORMAT_VERSION:
++        raise DecisionError(
++            f"prompt_format_version {version} is not served, this server uses version {PROMPT_FORMAT_VERSION}"
++        )
++    temperature = body.get("temperature", 1)
++    if (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
++            or not math.isfinite(temperature) or temperature <= 0):
++        raise DecisionError("temperature must be a number above 0")
++    kwargs = body.get("chat_template_kwargs")
++    if kwargs is None:
++        kwargs = {}
++    if not isinstance(kwargs, dict):
++        raise DecisionError("chat_template_kwargs must be an object")
++    _unknown(kwargs, frozenset({"enable_thinking"}))
++    if "enable_thinking" in kwargs and kwargs["enable_thinking"] is not False:
++        raise DecisionError("decisions need enable_thinking false or unset")
++    questions = body.get("questions")
++    if not isinstance(questions, list) or not questions:
++        raise DecisionError("questions must contain at least one question")
++    seen: set[str] = set()
++    for question in questions:
++        if not isinstance(question, dict):
++            raise DecisionError("each question must be an object")
++        ident = question.get("id")
++        if not isinstance(ident, str) or not ident.strip():
++            raise DecisionError("a question id must not be blank")
++        if ident in seen:
++            raise DecisionError(f"question id {ident!r} is repeated")
++        seen.add(ident)
++
++
++def _prepare_question(
++    tokenizer: Any, text: str, question: dict[str, Any], *, context_len: int | None,
++) -> PreparedQuestion:
++    kind, names, labels, content = _wording(text, question)
++    prompt, prompt_ids = _chat_prompt(tokenizer, content)
++    return _finish(
++        question["id"], kind, names, labels, prompt, prompt_ids, context_len,
++        lambda rendered: _encode(tokenizer, rendered),
++    )
++
++
++def prompts_for(
++    body: dict[str, Any], render: Any, encode: Any, *, context_len: int | None = None,
++) -> list[PreparedQuestion]:
++    """The same questions as prepare, for a server that renders text and encodes it itself (the CUDA GLM template)."""
++
++    _validate_body(body)
++    text = _render_text(body.get("input"))
++    if not text.strip():
++        raise DecisionError("input must not be blank")
++    prepared = []
++    for index, question in enumerate(body["questions"]):
++        try:
++            prepared.append(_from_text(render, encode, text, question, context_len=context_len))
++        except DecisionError as exc:
++            ident = question.get("id") if isinstance(question, dict) else None
++            where = repr(ident) if isinstance(ident, str) and ident else f"at position {index}"
++            raise DecisionError(f"question {where}: {exc}") from exc
++    return prepared
++
++
++def _from_text(
++    render: Any, encode: Any, text: str, question: dict[str, Any], *, context_len: int | None,
++) -> PreparedQuestion:
++    kind, names, labels, content = _wording(text, question)
++    prompt = render(content)
++    prompt_ids = [int(token) for token in encode(prompt)]
++    return _finish(question["id"], kind, names, labels, prompt, prompt_ids, context_len, encode)
++
++
++def _wording(text: str, question: dict[str, Any]) -> tuple[str, list[str], list[str], str]:
++    kind = question.get("type")
++    if kind == "choice":
++        _unknown(question, _CHOICE_FIELDS)
++        names, details, labels = _choice(question)
++        closing = "Answer with the letter of one option only."
++        lines = [_question_line(question)]
++        for label, name, detail in zip(labels, names, details):
++            lines.append(f"{label}: {name} - {detail}" if detail else f"{label}: {name}")
++    elif kind == "score":
++        _unknown(question, _SCORE_FIELDS)
++        names, details, labels = _score(question)
++        closing = "Answer with the number of one level only."
++        lines = [_question_line(question), *[f"{label}: {detail}" for label, detail in zip(labels, details)]]
++    elif kind == "yes_no":
++        _unknown(question, _YES_NO_FIELDS)
++        names, details, labels = (
++            ["yes", "no"],
++            [_optional_text(question.get("yes")), _optional_text(question.get("no"))],
++            ["yes", "no"],
++        )
++        closing = "Answer with yes or no only."
++        lead = _render_text(question.get("question"))
++        if not lead.strip():
++            raise DecisionError("a question must not be blank")
++        lines = [f"Is the following true? {lead}"]
++        for label, detail in zip(labels, details):
++            if detail:
++                lines.append(f"{label}: {detail}")
++    else:
++        raise DecisionError(f"unknown question type {kind!r}")
++    if kind != "yes_no":
++        lines = [line for line in lines if line]
++    lines.append(closing)
++    return kind, names, labels, "\n".join([text, "", *lines])
++
++
++def _finish(
++    question_id: str, kind: str, names: list[str], labels: list[str], prompt: str, prompt_ids: list[int],
++    context_len: int | None, encode: Any,
++) -> PreparedQuestion:
++    if context_len and len(prompt_ids) >= context_len:
++        raise DecisionError(
++            f"the prompt has {len(prompt_ids)} tokens, which does not fit the context length of {context_len} tokens"
++        )
++    return PreparedQuestion(
++        id=question_id, kind=kind, names=names, prompt_ids=prompt_ids,
++        label_ids=_label_ids(encode, prompt, prompt_ids, labels),
++    )
++
++
++def _choice(question: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
++    options = question.get("options")
++    if not isinstance(options, list) or not 2 <= len(options) <= 26:
++        raise DecisionError("a choice needs 2 to 26 options")
++    names, details = [], []
++    seen: set[str] = set()
++    for option in options:
++        if not isinstance(option, dict):
++            raise DecisionError("each option must be an object")
++        _unknown(option, _OPTION_FIELDS)
++        name = option.get("name")
++        if not isinstance(name, str) or _bad_name(name):
++            raise DecisionError("option names must not be blank or contain line breaks")
++        folded = name.strip().casefold()
++        if folded in seen:
++            raise DecisionError(f"option name {name!r} repeats another name")
++        seen.add(folded)
++        names.append(name.strip())
++        details.append(_optional_text(option.get("description")))
++    return names, details, list(string.ascii_uppercase[: len(names)])
++
++
++def _score(question: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
++    levels = question.get("levels")
++    if not isinstance(levels, list) or not 2 <= len(levels) <= 10:
++        raise DecisionError("a score needs 2 to 10 levels")
++    details = []
++    for level in levels:
++        text = _render_text(level)
++        if not text.strip():
++            raise DecisionError("a level must not be blank")
++        details.append(text)
++    names = [str(index) for index in range(len(details))]
++    return names, details, names
++
++
++def _question_line(question: dict[str, Any]) -> str:
++    text = _render_text(question.get("question"))
++    if not text.strip():
++        raise DecisionError("a question must not be blank")
++    return f"Question: {text}"
++
++
++def _chat_prompt(tokenizer: Any, content: str) -> tuple[str, list[int]]:
++    messages = [{"role": "user", "content": content}]
++    kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True, "enable_thinking": False}
++    try:
++        text = tokenizer.apply_chat_template(messages, **kwargs)
++    except TypeError:
++        kwargs.pop("enable_thinking")
++        text = tokenizer.apply_chat_template(messages, **kwargs)
++    if not isinstance(text, str):
++        raise DecisionError("the chat template did not return text")
++    try:
++        prompt_ids = render_prompt_ids(tokenizer, messages, enable_thinking=False)
++    except Exception as exc:
++        raise DecisionError(f"the chat template failed: {exc}") from exc
++    encoded = _encode(tokenizer, text)
++    if prompt_ids != encoded:
++        if prompt_ids[: len(encoded)] == encoded:
++            text += tokenizer.decode(prompt_ids[len(encoded):])
++            encoded = _encode(tokenizer, text)
++        if prompt_ids != encoded:
++            raise DecisionError("this tokenizer does not encode the rendered chat text back to the same ids")
++    if text.rfind("<think>") > text.rfind("</think>"):
++        raise DecisionError("the chat template leaves a reasoning block open at the answer position")
++    return text, prompt_ids
++
++
++def _label_ids(encode: Any, prompt: str, prompt_ids: list[int], labels: list[str]) -> list[int]:
++    found = []
++    for label in labels:
++        ids = [int(token) for token in encode(prompt + label)]
++        if len(ids) != len(prompt_ids) + 1 or ids[:-1] != prompt_ids or ids[-1] in found:
++            raise DecisionError(
++                f"the answer label {label!r} is not one distinct token after the chat prompt for this tokenizer, "
++                "so this model is not supported"
++            )
++        found.append(ids[-1])
++    return found
++
++
++def reduce_vocab_shards(rows: list[list[float]], label_ids: list[int], shard: int) -> tuple[list[float], float]:
++    """Join per-rank vocabulary shards into the label logits and the full-vocabulary logsumexp."""
++
++    if shard < 1 or not rows or any(not row for row in rows):
++        raise ValueError("label scoring needs a positive shard width and one row per rank")
++    peak = max(max(row) for row in rows)
++    total = math.fsum(math.exp(value - peak) for row in rows for value in row)
++    if not math.isfinite(peak) or total <= 0 or not math.isfinite(total):
++        raise ValueError("label scoring produced a non-finite logit")
++    logsumexp = peak + math.log(total)
++    logits = []
++    for token in label_ids:
++        rank, column = divmod(int(token), shard)
++        if rank < 0 or rank >= len(rows) or column >= len(rows[rank]):
++            raise ValueError(f"label token {token} is outside the vocabulary")
++        logits.append(float(rows[rank][column]))
++    if not math.isfinite(logsumexp) or any(not math.isfinite(value) for value in logits):
++        raise ValueError("label scoring produced a non-finite logit")
++    return logits, logsumexp
++
++
++def _softmax(logits: list[float], temperature: float) -> list[float]:
++    # Shift before dividing: finite logits / a tiny positive temperature can
++    # overflow, whereas the maximum's shifted value stays exactly zero.
++    peak = max(logits)
++    weights = [math.exp((logit - peak) / temperature) for logit in logits]
++    total = math.fsum(weights)
++    return [weight / total for weight in weights]
++
++
++def _encode(tokenizer: Any, text: str) -> list[int]:
++    return [int(token) for token in tokenizer.encode(text, add_special_tokens=False)]
++
++
++def _render_text(value: Any) -> str:
++    if value is None:
++        return ""
++    if isinstance(value, str):
++        return value
++    if isinstance(value, (dict, list)):
++        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
++    raise DecisionError("text must be a string, object, or array")
++
++
++def _optional_text(value: Any) -> str:
++    if value is None:
++        return ""
++    return _render_text(value)
++
++
++def _unknown(obj: dict[str, Any], allowed: frozenset[str]) -> None:
++    unknown = sorted(set(obj) - allowed)
++    if unknown:
++        raise DecisionError(f"unknown field {unknown[0]!r}")
++
++
++def _bad_name(name: str) -> bool:
++    stripped = name.strip()
++    return not stripped or any(ord(char) < 32 for char in stripped)
+diff --git a/src/tensorfold/server/http.py b/src/tensorfold/server/http.py
+index 9c9330d..6538330 100644
+--- a/src/tensorfold/server/http.py
++++ b/src/tensorfold/server/http.py
+@@ -11,7 +11,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ from typing import Any
+ 
+ from tensorfold.engine import grammar
+-from tensorfold.server import responses
++from tensorfold.server import anthropic, responses, token_routes
++from tensorfold.server.decisions import DecisionError
++from tensorfold.server.request_body import read_body
+ from tensorfold.server.tools import (active_tool_specs, parse_tool_calls_from_content, stream_tool_call_deltas,
+                                      tool_choice_requires_call)
+ from tensorfold.server.errors import CapacityError, RequestError, error_body
+@@ -99,6 +101,12 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+             # Tolerate query strings, trailing slashes and client URLs with or without the /v1 prefix.
+             return self.path.split("?", 1)[0].rstrip("/")
+ 
++        def _discard_body(self) -> None:
++            try:
++                read_body(self)
++            except RequestError:
++                self.close_connection = True
++
+         def do_GET(self) -> None:
+             route = self._route()
+             if responses.route(route):
+@@ -169,8 +177,14 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+ 
+         def do_POST(self) -> None:
+             route = self._route()
++            if anthropic.route(self.path):
++                return anthropic.post(self, app)
+             if responses.route(route) == "":         # a Response: this handler's chat completion, translated
+                 return responses.post(self, app)
++            if route.endswith("/decisions"):
++                return self._post_decisions(app)
++            if route in token_routes.ROUTES:         # vLLM's /tokenize and /detokenize
++                return self._post_tokenizer(route.endswith("/detokenize"))
+             is_chat_completion = route.endswith("/chat/completions")
+             is_text_completion = route.endswith("/completions") and not is_chat_completion
+             if not is_chat_completion and not is_text_completion:
+@@ -248,6 +262,8 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+                 extras: dict[str, Any] = {
+                     "exact_mode": app.exact_mode.get("mode", "target-verified")
+                 }
++                if reply.get("stop_sequence") is not None:
++                    extras["stop_sequence"] = reply["stop_sequence"]
+                 if reply.get("batch_size"):
+                     extras["tensorfold"] = {
+                         "batch_size": reply["batch_size"],
+@@ -480,4 +496,48 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
+                 except Exception:
+                     pass
+ 
++
++        def _post_tokenizer(self, detokenize: bool) -> None:
++            try:
++                body = json.loads(read_body(self) or b"{}")
++                reply = token_routes.detokenize(app, body) if detokenize else token_routes.tokenize(app, body)
++            except RequestError as exc:
++                self._send_json({"error": error_body(exc)}, status=503 if isinstance(exc, CapacityError) else 400)
++                return
++            except Exception as exc:  # noqa: BLE001 - a body the tokenizer cannot read is a client error
++                self._send_json({"error": {"message": str(exc), "type": "invalid_request_error"}}, status=400)
++                return
++            self._send_json(reply)
++
++        def _post_decisions(self, app: Any) -> None:
++            decide = getattr(app, "decisions", None)
++            if decide is None:
++                self._discard_body()
++                self._send_json({"error": {"message": f"unknown path {self.path}"}}, status=404)
++                return
++            try:
++                body = parse_numbers(json.loads(read_body(self) or b"{}"))
++                if not isinstance(body, dict):
++                    raise RequestError("request body must be an object")
++            except RequestError as exc:
++                self._send_json({"error": {"message": str(exc), "type": "invalid_request_error"}}, status=400)
++                return
++            except Exception as exc:  # noqa: BLE001 - a bad body is a client error
++                self._send_json({"error": {"message": str(exc), "type": "invalid_request_error"}}, status=400)
++                return
++            try:
++                payload = decide(body)
++            except (RequestError, DecisionError) as exc:
++                self._send_json({"error": {"message": str(exc), "type": "invalid_request_error"}}, status=400)
++                return
++            except Exception as exc:  # a scoring failure is the server's, not a bad body
++                print(f"[tensorfold] request error: {type(exc).__name__}: {exc}", flush=True)
++                traceback.print_exc()
++                try:
++                    self._send_json({"error": {"message": str(exc)}}, status=500)
++                except Exception:
++                    pass
++                return
++            self._send_json(payload)
++
+     return Handler
+diff --git a/src/tensorfold/server/request_body.py b/src/tensorfold/server/request_body.py
+new file mode 100644
+index 0000000..075c6c8
+--- /dev/null
++++ b/src/tensorfold/server/request_body.py
+@@ -0,0 +1,81 @@
++"""Bounded HTTP/1.1 request framing, shared by the CUDA and MLX handlers."""
++
++from __future__ import annotations
++
++import re
++from typing import Any
++
++from tensorfold.server.errors import RequestError
++
++LIMIT = 32 * 1024**2
++_METADATA_LIMIT = 65536
++
++
++def read_body(handler: Any, *, limit: int = LIMIT) -> bytes:
++    """Read one fixed-length or chunked body without consuming the next request."""
++
++    def refuse(message: str) -> None:
++        # Once framing is uncertain, unread bytes must not become another request.
++        handler.close_connection = True
++        raise RequestError(message)
++
++    def check_size(size: int) -> None:
++        if size > limit:
++            refuse(f"request body exceeds the {limit // 1024**2} MiB limit")
++
++    def exact(size: int) -> bytes:
++        data = handler.rfile.read(size)
++        if len(data) != size:
++            refuse("incomplete request body")
++        return data
++
++    def line() -> bytes:
++        data = handler.rfile.readline(_METADATA_LIMIT + 1)
++        if len(data) > _METADATA_LIMIT or not data.endswith(b"\r\n"):
++            refuse("invalid or oversized chunked request framing")
++        return data[:-2]
++
++    transfers = handler.headers.get_all("Transfer-Encoding", [])
++    lengths = handler.headers.get_all("Content-Length", [])
++    if transfers:
++        if lengths:
++            refuse("Content-Length and Transfer-Encoding cannot be combined")
++        codings = [value.strip().lower() for header in transfers for value in header.split(",")]
++        if codings != ["chunked"] or getattr(handler, "request_version", "HTTP/1.1") != "HTTP/1.1":
++            refuse("unsupported request Transfer-Encoding; expected chunked over HTTP/1.1")
++        body = bytearray()
++        extensions = 0
++        while True:
++            header = line()
++            size_text, separator, extension = header.partition(b";")
++            size_text = size_text.rstrip(b" \t") if separator else size_text
++            if not re.fullmatch(rb"[0-9a-fA-F]+", size_text):
++                refuse("invalid chunk size")
++            extensions += len(extension)
++            if extensions > _METADATA_LIMIT:
++                refuse("chunk extensions exceed the request framing limit")
++            size = int(size_text, 16)
++            check_size(len(body) + size)
++            if size == 0:
++                trailers = 0
++                while trailer := line():
++                    trailers += len(trailer) + 2
++                    if trailers > _METADATA_LIMIT or not re.match(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+:", trailer):
++                        refuse("invalid or oversized request trailers")
++                return bytes(body)
++            body.extend(exact(size))
++            if exact(2) != b"\r\n":
++                refuse("invalid chunk terminator")
++    if not lengths:
++        return b""
++    values = [value.strip() for header in lengths for value in header.split(",")]
++    if any(not re.fullmatch(r"[0-9]+", value) for value in values):
++        refuse("invalid Content-Length")
++    try:
++        sizes = [int(value) for value in values]
++    except ValueError:
++        refuse("invalid Content-Length")
++    if len(set(sizes)) != 1:
++        refuse("conflicting Content-Length values")
++    check_size(sizes[0])
++    return exact(sizes[0])
+diff --git a/src/tensorfold/server/responses.py b/src/tensorfold/server/responses.py
+index 8cf8212..24cb14d 100644
+--- a/src/tensorfold/server/responses.py
++++ b/src/tensorfold/server/responses.py
+@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
+ from typing import Any, Callable
+ 
+ from tensorfold.server.errors import RequestError
++from tensorfold.server.request_body import read_body
+ from tensorfold.server.responses_translate import Reply, _id, messages, translate
+ 
+ LIMIT = 32 * 1024**2
+@@ -111,6 +112,8 @@ def _send(handler: Any, status: int, payload: dict[str, Any]) -> None:
+         handler.send_response(status)
+         handler.send_header("Content-Type", "application/json")
+         handler.send_header("Content-Length", str(len(data)))
++        if handler.close_connection:                 # so a pooling client does not reuse the socket
++            handler.send_header("Connection", "close")
+         handler.end_headers()
+         handler.wfile.write(data)
+     except OSError:                                  # the client has gone
+@@ -180,12 +183,9 @@ def post(handler: Any, app: Any) -> None:
+ 
+     store = store_for(app)
+     try:
+-        length = int(handler.headers.get("Content-Length") or 0)
+-        if not 0 <= length <= LIMIT:
+-            handler.close_connection = True           # the unread body must not reach the next request
+-            raise RequestError("request body exceeds the 32 MiB limit")
++        data = read_body(handler, limit=LIMIT)
+         try:
+-            body = json.loads(handler.rfile.read(length) or b"{}")
++            body = json.loads(data or b"{}")
+         except (ValueError, UnicodeDecodeError):
+             raise RequestError("the request body is not JSON") from None
+         request = translate(body, store)
+diff --git a/src/tensorfold/server/stopping.py b/src/tensorfold/server/stopping.py
+index 95b7cd9..275d405 100644
+--- a/src/tensorfold/server/stopping.py
++++ b/src/tensorfold/server/stopping.py
+@@ -53,3 +53,9 @@ class StopPolicy:
+         shown = hide_tool_calls(content, finished=True) if tools else content
+         if shown.startswith(sent) and len(shown) > len(sent):
+             callback(shown[len(sent):])
++
++
++def matched_stop(text: str, strings: tuple[str, ...]) -> str | None:
++    """The first matched stop, ties in request order, before visible() strips it."""
++    matches = [(text.find(stop), at, stop) for at, stop in enumerate(strings) if stop in text]
++    return min(matches)[2] if matches else None
+diff --git a/src/tensorfold/server/token_routes.py b/src/tensorfold/server/token_routes.py
+new file mode 100644
+index 0000000..3a9a6d3
+--- /dev/null
++++ b/src/tensorfold/server/token_routes.py
+@@ -0,0 +1,107 @@
++"""vLLM's ``/tokenize`` and ``/detokenize`` on the Mac server: the ids the chat and completion routes would run.
++
++``POST /tokenize`` takes ``prompt`` (``add_special_tokens``, default true, as vLLM's) or ``messages`` with the chat
++fields that shape the prompt (``tools``, ``reasoning_effort``, ``chat_template_kwargs``) and ``add_generation_prompt``
++(default true); it answers ``count``, ``max_model_len`` and ``tokens``, plus ``token_strs`` with
++``return_token_strs``. ``POST /detokenize`` turns ``tokens`` back into ``prompt``, special tokens included. The CUDA
++server answers the same fields (``cuda.server.App.tokenize``)."""
++
++from __future__ import annotations
++
++from typing import Any
++
++from tensorfold.server.errors import RequestError
++from tensorfold.server.messages import normalize_messages
++from tensorfold.server.prompts import has_images, prepare_prompt
++from tensorfold.server.request_options import thinking_fields
++from tensorfold.server.text import render_prompt_ids
++from tensorfold.server.tools import active_tool_specs
++
++ROUTES = ("/tokenize", "/v1/tokenize", "/detokenize", "/v1/detokenize")
++
++
++def flag(body: dict[str, Any], name: str, default: bool) -> bool:
++    """A boolean request field; RequestError when it is there and not a boolean."""
++
++    value = body.get(name, default)
++    if not isinstance(value, bool):
++        raise RequestError(f"{name} must be a boolean")
++    return value
++
++
++def _vocab(tokenizer: Any) -> int | None:
++    """The vocabulary's size, added tokens included, through the wrappers families put around a tokenizer (GLM's and
++    DeepSeek's ``_inner``, mlx-lm's ``_tokenizer``); None when none of them tells."""
++
++    for _ in range(4):
++        if hasattr(type(tokenizer), "__len__"):
++            return len(tokenizer)
++        if hasattr(type(tokenizer), "get_vocab_size"):              # a tokenizers.Tokenizer
++            return int(tokenizer.get_vocab_size(with_added_tokens=True))
++        attributes = getattr(tokenizer, "__dict__", {})
++        tokenizer = next((attributes[k] for k in ("_inner", "inner", "_tokenizer") if k in attributes), None)
++        if tokenizer is None:
++            return None
++    return None
++
++
++def token_ids(value: Any, vocab: int | None, field: str = "tokens") -> list[int]:
++    """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the vocabulary."""
++
++    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], list):
++        value = value[0]
++    if not isinstance(value, list) or any(type(t) is not int for t in value):
++        raise RequestError(f"{field} must be a list of integer token ids (one prompt a request)")
++    if any(t < 0 or (vocab is not None and t >= vocab) for t in value):
++        top = "" if vocab is None else f" to {vocab - 1}"
++        raise RequestError(f"{field} token ids must be in the vocabulary's range 0{top}")
++    return list(value)
++
++
++def tokenize(app: Any, body: Any) -> dict[str, Any]:
++    """A prompt's or a chat request's ids, rendered as ``ChatApp.chat`` renders them."""
++
++    if not isinstance(body, dict):
++        raise RequestError("the request body must be a JSON object")
++    strings = flag(body, "return_token_strs", False)
++    if "messages" in body:
++        generation = flag(body, "add_generation_prompt", True)
++        messages = normalize_messages(body["messages"], allow_images=getattr(app, "vision", None) is not None)
++        try:
++            tools = active_tool_specs(body.get("tools"), body.get("tool_choice"))
++        except ValueError as exc:
++            raise RequestError(str(exc)) from None
++        fields = thinking_fields(body, getattr(app, "effort_levels", frozenset()))
++        requested = fields.get("enable_thinking")
++        thinking = app.enable_thinking if requested is None else bool(requested)
++        if has_images(messages):
++            if not generation:
++                raise RequestError("add_generation_prompt false is not supported with images")
++            ids = prepare_prompt(app, messages, tools, thinking, None, fields).tokens
++        else:
++            with app.tokenizer_lock:
++                ids = render_prompt_ids(app.tokenizer, messages, tools=tools, enable_thinking=thinking,
++                                        reasoning_effort=app.effort_for(fields.get("reasoning_effort")),
++                                        add_generation_prompt=generation, late_system=app.late_system)
++    else:
++        text = body.get("prompt")
++        if not isinstance(text, str):
++            raise RequestError("prompt must be a string (or send messages)")
++        with app.tokenizer_lock:
++            ids = list(app.tokenizer.encode(text, add_special_tokens=flag(body, "add_special_tokens", True)))
++    reply: dict[str, Any] = {"count": len(ids), "max_model_len": int(getattr(app, "context_window", 0)) or None,
++                             "tokens": [int(t) for t in ids]}
++    if strings:
++        with app.tokenizer_lock:
++            reply["token_strs"] = list(app.tokenizer.convert_ids_to_tokens(reply["tokens"]))
++    return reply
++
++
++def detokenize(app: Any, body: Any) -> dict[str, Any]:
++    """The text of ``tokens``, special tokens included."""
++
++    if not isinstance(body, dict):
++        raise RequestError("the request body must be a JSON object")
++    with app.tokenizer_lock:
++        ids = token_ids(body.get("tokens"), _vocab(app.tokenizer))
++        return {"prompt": app.tokenizer.decode(ids, skip_special_tokens=False)}
+diff --git a/tests/test_anthropic_api.py b/tests/test_anthropic_api.py
+new file mode 100644
+index 0000000..5d77cee
+--- /dev/null
++++ b/tests/test_anthropic_api.py
+@@ -0,0 +1,382 @@
++"""Messages protocol integration tests: real HTTP handlers with deterministic test engines, without model inference."""
++import json
++from contextlib import contextmanager
++
++import pytest
++
++from tensorfold.server.anthropic_translate import Reply, translate, usage
++from tensorfold.server.errors import RequestError
++from tests.test_cuda_admission import http_server
++from tests.test_cuda_tool_choice import Engine, app_for
++from tests.test_lane_server import make_app
++from tests.test_responses_api import call, stream_events
++from tests.test_server_openai_compat import FakeApp, serve_fake
++
++BASE = {"model": "local-model", "max_tokens": 128, "messages": [{"role": "user", "content": "Hi"}]}
++
++
++@contextmanager
++def serving(backend, tmp_path, *, fail=False):
++    if backend == "cuda":
++        app = app_for(tmp_path, Engine())
++        with http_server(app) as port:
++            yield app, port
++    else:
++        app = FakeApp(reasoning="hmm", fail_stream=fail)
++        server = serve_fake(app)
++        try:
++            yield app, server.server_port
++        finally:
++            server.shutdown()
++            server.server_close()
++
++
++def reconstruct(events):
++    assert events[0]["type"] == "message_start"
++    assert events[-1]["type"] == "message_stop"
++    blocks, open_blocks = [], set()
++    for event in events[1:-2]:
++        kind = event["type"]
++        at = event["index"]
++        if kind == "content_block_start":
++            assert at == len(blocks) and not open_blocks
++            blocks.append(dict(event["content_block"]))
++            open_blocks.add(at)
++            if blocks[at]["type"] == "tool_use":
++                blocks[at]["input"] = ""
++        elif kind == "content_block_delta":
++            assert at in open_blocks
++            delta, block = event["delta"], blocks[at]
++            mapping = {"text_delta": ("text", "text"), "thinking_delta": ("thinking", "thinking"),
++                       "signature_delta": ("thinking", "signature"), "input_json_delta": ("tool_use", "partial_json")}
++            expected, key = mapping[delta["type"]]
++            assert block["type"] == expected
++            target = "input" if key == "partial_json" else key
++            block[target] = block.get(target, "") + delta[key]
++        elif kind == "content_block_stop":
++            open_blocks.remove(at)
++            if blocks[at]["type"] == "tool_use":
++                blocks[at]["input"] = json.loads(blocks[at]["input"])
++        else:
++            raise AssertionError(kind)
++    assert not open_blocks
++    assert events[-2]["type"] == "message_delta"
++    return blocks
++
++
++@pytest.mark.parametrize("backend", ["mlx", "cuda"])
++@pytest.mark.parametrize("stream", [False, True])
++def test_text_and_thinking_over_http(backend, stream, tmp_path):
++    with serving(backend, tmp_path) as (_, port):
++        status, body = call(port, "POST", "/v1/messages?beta=true", {**BASE, "stream": stream,
++                            "thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}})
++    assert status == 200
++    if stream:
++        events = stream_events(body)
++        blocks = reconstruct(events)
++        assert any(b["type"] == "thinking" and b["thinking"] for b in blocks)
++        assert any(b["type"] == "text" and b["text"] for b in blocks)
++        assert events[-2]["delta"]["stop_reason"] == "end_turn"
++        assert events[-2]["usage"]["output_tokens"] > 0
++    else:
++        payload = json.loads(body)
++        assert payload["type"] == "message" and payload["role"] == "assistant"
++        assert payload["content"] and payload["usage"]["output_tokens"] > 0
++        assert payload["stop_reason"] == "end_turn"
++
++
++def test_parallel_tool_history_and_error_result_are_preserved():
++    body = {**BASE, "system": [{"type": "text", "text": "Rules", "cache_control": {"type": "ephemeral"}}],
++            "messages": [{"role": "assistant", "content": [
++                {"type": "thinking", "thinking": "plan", "signature": ""},
++                {"type": "tool_use", "id": "a", "name": "weather", "input": {"city": "Taipei"}},
++                {"type": "tool_use", "id": "b", "name": "weather", "input": {"city": "Oslo"}}]},
++                {"role": "user", "content": [
++                    {"type": "tool_result", "tool_use_id": "a", "content": [{"type": "text", "text": "sun"}]},
++                    {"type": "tool_result", "tool_use_id": "b", "content": "offline", "is_error": True},
++                    {"type": "text", "text": "Summarize"}]}]}
++    chat = translate(body)
++    assert [m["role"] for m in chat["messages"]] == ["system", "assistant", "tool", "tool", "user"]
++    assistant = chat["messages"][1]
++    assert assistant["reasoning_content"] == "plan"
++    assert [json.loads(c["function"]["arguments"])["city"] for c in assistant["tool_calls"]] == ["Taipei", "Oslo"]
++    assert chat["messages"][3]["content"] == "Tool error: offline"
++
++
++@pytest.mark.parametrize("stream", [False, True])
++def test_cuda_required_tool_and_result_round_trip(stream, tmp_path):
++    tools = [{"name": "get_weather", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}]
++    with serving("cuda", tmp_path) as (_, port):
++        status, raw = call(port, "POST", "/messages/", {**BASE, "tools": tools, "stream": stream,
++                                                       "tool_choice": {"type": "tool", "name": "get_weather"}})
++        assert status == 200
++        if stream:
++            events = stream_events(raw)
++            blocks = reconstruct(events)
++            assert events[-2]["delta"]["stop_reason"] == "tool_use"
++        else:
++            response = json.loads(raw)
++            blocks = response["content"]
++            assert response["stop_reason"] == "tool_use"
++        block = next(b for b in blocks if b["type"] == "tool_use")
++        assert block["name"] == "get_weather" and block["input"] == {"city": "Oslo"}
++        history = [*BASE["messages"], {"role": "assistant", "content": blocks}, {"role": "user", "content": [
++            {"type": "tool_result", "tool_use_id": block["id"], "content": "sunny"}]}]
++        status, raw = call(port, "POST", "/v1/messages", {**BASE, "messages": history, "tools": tools,
++                                                        "tool_choice": {"type": "none"}})
++        assert status == 200 and json.loads(raw)["stop_reason"] == "end_turn"
++
++
++def test_interleaved_tool_arguments_do_not_receive_text_deltas():
++    events = []
++    reply = Reply("model", events.append)
++    reply.start()
++    def chunk(delta):
++        reply.chunk({"choices": [{"delta": delta}]})
++    chunk({"reasoning_content": "plan"})
++    chunk({"tool_calls": [{"index": 0, "id": "a", "function": {"name": "first", "arguments": '{"x":'}}]})
++    chunk({"content": "\n"})
++    chunk({"tool_calls": [{"index": 1, "id": "b", "function": {"name": "second", "arguments": "{}"}}]})
++    chunk({"tool_calls": [{"index": 0, "function": {"arguments": "1}"}}]})
++    reply.chunk({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
++    reply.chunk(None)
++    blocks = reconstruct(events)
++    assert [b["input"] for b in blocks if b["type"] == "tool_use"] == [{"x": 1}, {}]
++
++
++def test_cache_usage_is_not_double_counted():
++    result = usage({"prompt_tokens": 90, "completion_tokens": 12, "prompt_tokens_details": {"cached_tokens": 64}})
++    assert result == {"input_tokens": 26, "output_tokens": 12, "cache_read_input_tokens": 64,
++                      "cache_creation_input_tokens": 0}
++
++
++@pytest.mark.parametrize("backend", ["mlx", "cuda"])
++@pytest.mark.parametrize("patch", [
++    {"max_tokens": 0}, {"max_tokens": True}, {"stream": "yes"}, {"messages": []},
++    {"messages": [{"role": "user", "content": [{"type": "document"}]}]},
++    {"thinking": {"type": "enabled", "budget_tokens": 150}},
++    {"tools": [{"type": "web_search_20250305", "name": "web_search"}]},
++    {"tool_choice": {"type": "bogus"}}, {"output_config": {"effort": "bogus"}},
++    {"stop_sequences": "END"},
++])
++def test_request_errors_have_anthropic_shape_before_streaming(backend, patch, tmp_path):
++    with serving(backend, tmp_path) as (_, port):
++        status, raw = call(port, "POST", "/v1/messages", {**BASE, "stream": True, **patch})
++    problem = json.loads(raw)
++    assert status == 400 and problem["type"] == "error" and problem["error"]["type"] == "invalid_request_error"
++
++
++def test_stream_failure_is_an_error_not_success(tmp_path):
++    with serving("mlx", tmp_path, fail=True) as (_, port):
++        status, raw = call(port, "POST", "/v1/messages", {**BASE, "stream": True})
++    events = stream_events(raw)
++    assert status == 200 and events[-1]["type"] == "error"
++    assert events[-1]["error"]["type"] == "api_error"
++    assert all(e["type"] != "message_stop" for e in events)
++
++
++def test_token_count_uses_cuda_prompt_without_generation(tmp_path):
++    with serving("cuda", tmp_path) as (app, port):
++        body = {k: v for k, v in BASE.items() if k != "max_tokens"}
++        status, raw = call(port, "POST", "/v1/messages/count_tokens", body)
++        assert status == 200
++        assert json.loads(raw)["input_tokens"] == len(app.prepare(translate(body, count=True), True).prompt)
++        assert not app.engine.calls
++
++
++def test_image_sources_and_tool_result_images():
++    image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA"}}
++    result = translate({**BASE, "messages": [{"role": "user", "content": [image]}]})
++    assert result["messages"][0]["content"] == [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]
++    result = translate({**BASE, "messages": [{"role": "user", "content": [
++        {"type": "tool_result", "tool_use_id": "a", "content": [{"type": "text", "text": "screenshot"}, image]}]}]})
++    assert [m["role"] for m in result["messages"]] == ["tool"]
++    assert result["messages"][0]["tool_call_id"] == "a"
++    assert result["messages"][0]["content"] == [
++        {"type": "text", "text": "screenshot"},
++        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
++    ]
++
++
++def test_parallel_tool_images_keep_their_tool_id_and_content_order():
++    image = lambda data: {"type": "image", "source": {
++        "type": "base64", "media_type": "image/png", "data": data}}
++    body = {**BASE, "messages": [{"role": "user", "content": [
++        {"type": "tool_result", "tool_use_id": "a", "is_error": True, "content": [
++            image("AA"), {"type": "text", "text": "first"}]},
++        {"type": "tool_result", "tool_use_id": "b", "content": [
++            {"type": "text", "text": "second"}, image("BB")]},
++        {"type": "text", "text": "Compare them"},
++    ]}]}
++    original = json.loads(json.dumps(body))
++    messages = translate(body)["messages"]
++    assert [m["role"] for m in messages] == ["tool", "tool", "user"]
++    assert [m["tool_call_id"] for m in messages[:2]] == ["a", "b"]
++    assert messages[0]["content"] == [
++        {"type": "text", "text": "Tool error: "},
++        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}},
++        {"type": "text", "text": "first"},
++    ]
++    assert messages[1]["content"] == [
++        {"type": "text", "text": "second"},
++        {"type": "image_url", "image_url": {"url": "data:image/png;base64,BB"}},
++    ]
++    assert messages[2]["content"] == [{"type": "text", "text": "Compare them"}]
++    assert body == original
++
++
++@pytest.mark.parametrize("backend", ["mlx", "cuda"])
++def test_tool_image_reaches_the_vision_renderer_as_its_tool_result(backend, tmp_path):
++    from types import SimpleNamespace
++
++    from tensorfold.server.messages import normalize_messages
++    from tests.test_vision_server import Frontend, Tokenizer, image_messages
++
++    url = image_messages()[0]["content"][1]["image_url"]["url"]
++    body = {**BASE, "messages": [{"role": "user", "content": [{
++        "type": "tool_result", "tool_use_id": "shot", "content": [
++            {"type": "text", "text": "PAGE"},
++            {"type": "image", "source": {"type": "url", "url": url}},
++        ],
++    }]}]}
++    rendered = []
++    with serving(backend, tmp_path) as (app, port):
++        app.vision = Frontend()
++        if backend == "cuda":
++            def render(messages, **kwargs):
++                rendered.append(normalize_messages(messages, allow_images=kwargs.get("allow_images", False)))
++                return "rendered image prompt"
++            app.template = SimpleNamespace(render=render)
++        else:
++            app.tokenizer = Tokenizer()
++            app.effort_levels, app.enable_thinking, app.reasoning_effort = frozenset(), False, None
++            app.late_system, app.context_window = "system", 32
++        status, raw = call(port, "POST", "/v1/messages/count_tokens", body)
++        assert status == 200 and json.loads(raw)["input_tokens"] == 4
++        template = rendered[0] if backend == "cuda" else app.tokenizer.calls[0][0]
++        assert template == [{"role": "tool", "tool_call_id": "shot", "content": [
++            {"type": "text", "text": "PAGE"}, {"type": "image", "detail": "auto"},
++        ]}]
++        assert len(app.vision.calls[0][1]) == 1
++
++
++def test_thinking_controls_and_output_schema():
++    request = translate({**BASE, "thinking": {"type": "enabled", "budget_tokens": 20},
++                         "output_config": {"effort": "low", "format": {"type": "json_schema", "schema": {"type": "object"}}}})
++    assert request["thinking_budget"] == 20 and request["chat_template_kwargs"]["enable_thinking"]
++    assert request["response_format"]["json_schema"]["schema"] == {"type": "object"}
++    request = translate({**BASE, "thinking": {"type": "disabled"}, "output_config": {"effort": "high"}})
++    assert request["reasoning_effort"] == "none" and not request["chat_template_kwargs"]["enable_thinking"]
++
++
++def test_non_object_request_is_refused():
++    with pytest.raises(RequestError):
++        translate([])
++
++
++@pytest.mark.parametrize("stream", [False, True])
++def test_stop_sequence_returns_the_match_and_strips_it(stream, tmp_path):
++    with serving("cuda", tmp_path) as (_, port):
++        status, raw = call(port, "POST", "/v1/messages", {**BASE, "stream": stream, "stop_sequences": [" How"]})
++    assert status == 200
++    if stream:
++        events = stream_events(raw)
++        content = reconstruct(events)
++        delta = events[-2]["delta"]
++    else:
++        reply = json.loads(raw)
++        content, delta = reply["content"], reply
++    assert delta["stop_reason"] == "stop_sequence" and delta["stop_sequence"] == " How"
++    assert content == [{"type": "text", "text": "Hello!"}]
++
++
++def test_claude_keep_all_thinking_is_accepted_and_other_edits_are_refused():
++    body = {**BASE, "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}}
++    assert translate(body)["messages"] == translate(BASE)["messages"]
++    with pytest.raises(RequestError):
++        translate({**BASE, "context_management": {"edits": [{"type": "clear_tool_uses_20250919"}]}})
++
++
++def test_tool_arguments_stream_before_completion():
++    events = []
++    reply = Reply("model", events.append)
++    reply.start()
++    reply.chunk({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "a", "function": {
++        "name": "write", "arguments": '{"content":"hello'}}]}}]})
++    assert events[-1]["delta"] == {"type": "input_json_delta", "partial_json": '{"content":"hello'}
++    reply.chunk({"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"arguments": '"}'}}]},
++                             "finish_reason": "tool_calls"}]})
++    reply.chunk(None)
++    assert reconstruct(events) == [{"type": "tool_use", "id": "a", "name": "write", "input": {"content": "hello"}}]
++
++
++@pytest.mark.parametrize("thinking", [{"type": "disabled"}, {"type": "adaptive"}])
++def test_mlx_token_count_renders_without_generation(thinking):
++    app = make_app(enable_thinking=False, reasoning_effort="medium")
++    def refuse_generation(*args, **kwargs):
++        raise AssertionError("token counting must not generate")
++    app.chat = refuse_generation
++    server = serve_fake(app)
++    try:
++        body = {**BASE, "max_tokens": 2, "thinking": thinking, "output_config": {"effort": "low"}}
++        status, raw = call(server.server_port, "POST", "/v1/messages/count_tokens", body)
++        assert status == 200
++        count = json.loads(raw)["input_tokens"]
++        # The model's char tokenizer renders Hi, one message delimiter and the two-token generation marker.
++        assert count == 5
++    finally:
++        server.shutdown()
++        server.server_close()
++        app.close()
++
++
++def test_thinking_token_usage_is_preserved():
++    result = usage({"prompt_tokens": 90, "completion_tokens": 20,
++                    "completion_tokens_details": {"reasoning_tokens": 12}})
++    assert result["output_tokens"] == 20 and result["output_tokens_details"] == {"thinking_tokens": 12}
++
++
++@pytest.mark.parametrize("thinking", [None, {"type": "disabled"}])
++def test_thinking_is_opt_in(thinking):
++    chat = translate({**BASE, "thinking": thinking, "output_config": {"effort": "high"}})
++    assert chat["chat_template_kwargs"]["enable_thinking"] is False
++    assert chat["reasoning_effort"] == "none"
++
++
++@pytest.mark.parametrize("tool_result", [False, True])
++@pytest.mark.parametrize("backend", ["mlx", "cuda"])
++def test_mid_conversation_system_after_user_or_tool_result(backend, tool_result, tmp_path):
++    history = [{"role": "user", "content": "Read the file"}]
++    if tool_result:
++        history.extend([{"role": "assistant", "content": [{"type": "tool_use", "id": "a", "name": "read", "input": {}}]},
++                        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a", "content": "data"}]}])
++    before = translate({**BASE, "system": "Top-level rules", "messages": history})["messages"]
++    history.extend([{"role": "system", "content": [{"type": "text", "text": "New instructions"}]},
++                    {"role": "system", "content": "More instructions"}])
++    translated = translate({**BASE, "system": "Top-level rules", "messages": history})["messages"]
++    assert translated[:len(before)] == before
++    assert [m["role"] for m in translated[-2:]] == ["system", "system"]
++    with serving(backend, tmp_path) as (_, port):
++        status, raw = call(port, "POST", "/v1/messages", {**BASE, "messages": history})
++        assert status == 200 and json.loads(raw)["stop_reason"] == "end_turn"
++
++
++@pytest.mark.parametrize("history", [
++    [{"role": "system", "content": "rules"}, {"role": "user", "content": "hello"}],
++    [{"role": "assistant", "content": "hello"}, {"role": "system", "content": "rules"}],
++    [{"role": "user", "content": "hello"}, {"role": "system", "content": "rules"}, {"role": "user", "content": "again"}],
++    [{"role": "user", "content": "hello"}, {"role": "system", "content": [{"type": "image", "source": {}}]}],
++    [{"role": "user", "content": "hello"}, {"role": "system", "content": "rules", "clear_at": "next_user_message"}],
++])
++def test_invalid_mid_conversation_system_is_rejected(history):
++    with pytest.raises(RequestError):
++        translate({**BASE, "messages": history})
++
++
++@pytest.mark.parametrize("path", ["/v1/messages", "/v1/messages/count_tokens"])
++def test_mid_conversation_system_does_not_fall_back_to_user(path, tmp_path):
++    with serving("mlx", tmp_path) as (app, port):
++        app.late_system = "user"
++        status, raw = call(port, "POST", path, {**BASE, "messages": [*BASE["messages"],
++                            {"role": "system", "content": "rules"}]})
++        assert status == 400 and "chat template" in json.loads(raw)["error"]["message"]
+diff --git a/tests/test_server_refused_bodies.py b/tests/test_server_refused_bodies.py
+new file mode 100644
+index 0000000..09e2372
+--- /dev/null
++++ b/tests/test_server_refused_bodies.py
+@@ -0,0 +1,54 @@
++"""A refused request's body never reaches the next request on its connection, on either server."""
++
++import http.client
++import json
++import socket
++
++import pytest
++
++pytest.importorskip("jinja2")
++
++from tests.test_cuda_admission import http_server
++from tests.test_cuda_server_errors import HI, app_for
++from tests.test_server_openai_compat import FakeApp, serve_fake
++
++
++@pytest.fixture(params=["cuda", "mac"])
++def port(request, tmp_path):
++    if request.param == "cuda":
++        with http_server(app_for(tmp_path)) as cuda_port:
++            yield cuda_port
++    else:
++        server = serve_fake(FakeApp())
++        yield server.server_port
++        server.shutdown()
++        server.server_close()
++
++
++def test_a_post_to_an_unknown_route_leaves_the_connection_usable(port):
++    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
++    try:
++        connection.request("POST", "/v1/not-a-route", json.dumps({"max_tokens": 16}),
++                           {"Content-Type": "application/json"})
++        refused = connection.getresponse()
++        refused.read()
++        connection.request("POST", "/v1/chat/completions", json.dumps({"messages": HI, "max_tokens": 8}),
++                           {"Content-Type": "application/json"})
++        answered = connection.getresponse()
++        answered.read()
++    finally:
++        connection.close()
++    assert (refused.status, answered.status) == (404, 200)
++
++
++@pytest.mark.parametrize("path", ["/v1/chat/completions", "/v1/responses"])
++def test_an_oversized_body_is_refused_and_the_connection_closed_as_the_reply_says(port, path):
++    with socket.create_connection(("127.0.0.1", port), timeout=10) as client:
++        client.sendall(f"POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
++                       "Content-Length: 40000000\r\n\r\n".encode())
++        reply = b""
++        while chunk := client.recv(65536):      # the server closes once it has answered
++            reply += chunk
++    head = reply.split(b"\r\n\r\n", 1)[0].decode().lower().splitlines()
++    assert head[0].split()[1] == "400"
++    assert "connection: close" in head
+-- 
+2.53.0
+

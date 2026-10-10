@@ -4,6 +4,12 @@ OpenAI-compatible on `HOST:PORT` (`127.0.0.1:8000` by default: put your own prox
 `/v1/chat/completions` (streaming, tool calls, `response_format`), `/v1/completions` (text or token ids),
 `/tokenize`, `/v1/models` (`max_model_len`), `/health`, `/metrics`.
 
+Anthropic Messages API (backported from TensorFold v0.6.3) on the same port: `/v1/messages` (JSON or SSE) and
+`/v1/messages/count_tokens`. It accepts `system`, text/image blocks, `tool_use`/`tool_result`, `stop_sequences`,
+`thinking` (disabled / enabled with `budget_tokens` / adaptive) and `output_config` effort and JSON schema, and
+reuses this server's prompt encoding. Thinking is off unless the request enables it. This is what Claude Code and
+other Anthropic clients connect to.
+
 Thinking follows DeepSeek-V4.1's encoding (`Reasoning Effort: N (range 1-100)`), on by default
 (`TF_DSV41_THINKING=0` turns it off). Both the top-level `reasoning_effort` and
 `chat_template_kwargs.reasoning_effort` are read (the kwargs win):

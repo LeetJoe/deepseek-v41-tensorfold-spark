@@ -3,6 +3,14 @@
 The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a) -> `da5ae43` (G16) -> `cd4245a`
 (G18) -> **`7bd2d67`** (G19). Each window's write-up is in [`docs/campaign/`](campaign/README.md).
 
+## New
+
+- **Anthropic Messages API** (`patches/0003-anthropic-api.patch`). The v0.6.0 TensorFold submodule now carries the
+  `/v1/messages` and `/v1/messages/count_tokens` routes backported from TensorFold v0.6.3 (the translation layer, the
+  request-framing reader, the Anthropic reply/stream encoder), wired onto the Spark, CUDA and generic HTTP handlers.
+  Claude Code and other Anthropic clients can point at the server directly, over JSON or SSE, with tools, thinking and
+  image input. `stop_sequences` round-trips through `matched_stop` and the reply `stop_sequence`.
+
 ## Bugs fixed
 
 - **A duplicate image in one request killed both ranks** (G16). The vision row store counted a reference per
